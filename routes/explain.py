@@ -28,14 +28,24 @@ async def explain_lab_parameters(body: ExplainRequest) -> ExplainResponse:
     if not body.parameters:
         raise HTTPException(status_code=400, detail="At least one parameter is required")
 
+    print("Explain request language:", body.language, "| stage: route/explain.py")
+    print("  -> language repr:", repr(body.language), "type:", type(body.language).__name__)
     logger.info(
-        "Explain request: %d parameter(s), language=%s",
+        "Explain request: %d parameter(s), language=%s (repr=%r)",
         len(body.parameters),
+        body.language,
         body.language,
     )
 
     try:
         result = explain_parameters(body.parameters, body.language)
+        print(
+            "Explain request language:",
+            body.language,
+            "| stage: route/response",
+            "| used_fallback:",
+            result.used_fallback,
+        )
     except Exception as exc:
         logger.exception("Unexpected error in explain_parameters")
         raise HTTPException(

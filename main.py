@@ -5,9 +5,14 @@ FastAPI application entry point for OPD Report Simplifier.
 import os
 from contextlib import asynccontextmanager
 
+import logging
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
 
 from routes.explain import router as explain_router
 from routes.upload import router as upload_router
@@ -31,6 +36,28 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Log 422 details to aid debugging of schema/enum mismatches."""
+    logger.warning(
+        "422 Unprocessable Entity on %s %s — errors: %s",
+        request.method,
+        request.url.path,
+        exc.errors(),
+    )
+    for err in exc.errors():
+        print(
+            f"  422 validation error: loc={err.get('loc')} "
+            f"type={err.get('type')!r} msg={err.get('msg')!r} "
+            f"input={err.get('input')!r}"
+        )
+    return JSONResponse(
+        status_code=422,
+        content={"success": False, "detail": exc.errors()},
+    )
 
 # CORS — allow frontend origins from env or default to local dev
 _cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")

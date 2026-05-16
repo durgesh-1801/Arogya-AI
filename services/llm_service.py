@@ -1,7 +1,8 @@
 """
-Gemini LLM service for plain-language lab explanations.
+LLM service for plain-language lab explanations (Groq provider).
 
-The backend parser remains the source of truth; Gemini only explains given parameters.
+The backend parser remains the source of truth; the LLM only explains given parameters.
+Provider logic is isolated in ``GroqClient`` for reuse by /api/explain and future /api/chat.
 """
 
 from __future__ import annotations
@@ -15,27 +16,36 @@ from typing import Any, Literal
 from pydantic import ValidationError
 
 from prompts.explain_prompt import (
-    MEDICAL_DISCLAIMER,
-    build_full_prompt,
+    apply_global_disclaimer,
+    build_strict_retry_user_prompt,
+    build_system_instruction,
+    build_user_prompt,
+    cleanup_explanation_text,
+    is_placeholder_parameter,
+    normalize_language,
     parse_gemini_json,
 )
 from schemas.explain_schema import ExplainResponse, ExplainedParameter, ParameterExplainInput
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-1.5-flash"
+DEFAULT_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_TIMEOUT_SECONDS = 30
+
+# Low temperature for concise, deterministic medical copy
+DEFAULT_TEMPERATURE = 0.1
+DEFAULT_MAX_TOKENS = 2048
 
 UrgencyLevel = Literal["low", "medium", "high"]
 
 # ---------------------------------------------------------------------------
-# Reusable Gemini client
+# Groq client (provider-isolated)
 # ---------------------------------------------------------------------------
 
 
-class GeminiClient:
+class GroqClient:
     """
-    Thin wrapper around google-generativeai for a single model.
+    Thin wrapper around the Groq Python SDK for chat completions.
 
     Configured once per process; safe to reuse across requests.
     """
@@ -45,79 +55,127 @@ class GeminiClient:
         api_key: str | None = None,
         model_name: str = DEFAULT_MODEL,
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
     ):
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
+        self.api_key = api_key or os.getenv("GROQ_API_KEY", "")
         self.model_name = model_name
         self.timeout_seconds = timeout_seconds
-        self._model: Any = None
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self._client: Any = None
         self._executor = ThreadPoolExecutor(max_workers=4)
 
         if not self.api_key:
-            logger.warning("GEMINI_API_KEY is not set; Gemini calls will use fallback only")
+            logger.warning("GROQ_API_KEY is not set; LLM calls will use fallback templates only")
 
-    def _get_model(self) -> Any:
-        if self._model is None:
+    def _get_client(self) -> Any:
+        if self._client is None:
             if not self.api_key:
-                raise RuntimeError("GEMINI_API_KEY is not configured")
+                raise RuntimeError("GROQ_API_KEY is not configured")
             try:
-                import google.generativeai as genai
+                from groq import Groq
             except ImportError as exc:
                 raise RuntimeError(
-                    "google-generativeai is not installed. Run: pip install google-generativeai"
+                    "groq is not installed. Run: pip install groq"
                 ) from exc
-            genai.configure(api_key=self.api_key)
-            self._model = genai.GenerativeModel(self.model_name)
-        return self._model
+            self._client = Groq(
+                api_key=self.api_key,
+                timeout=float(self.timeout_seconds),
+            )
+        return self._client
 
-    def generate(self, prompt: str) -> str:
+    def complete_chat(self, messages: list[dict[str, str]]) -> str:
         """
-        Call Gemini with a timeout.
+        Run a chat completion with timeout enforcement.
+
+        Args:
+            messages: OpenAI-style role/content dicts (system, user, assistant).
 
         Returns:
-            Raw text response from the model.
+            Assistant message text.
 
         Raises:
-            RuntimeError: On API errors or timeout.
+            RuntimeError: On API errors, empty response, or timeout.
         """
-        model = self._get_model()
+        client = self._get_client()
 
         def _call() -> str:
-            response = model.generate_content(prompt)
-            if not response or not response.text:
-                raise RuntimeError("Gemini returned an empty response")
-            return response.text
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+            if not response.choices:
+                raise RuntimeError("Groq returned no choices")
+            content = response.choices[0].message.content
+            if not content or not content.strip():
+                raise RuntimeError("Groq returned an empty response")
+            return content.strip()
 
         try:
             future = self._executor.submit(_call)
             return future.result(timeout=self.timeout_seconds)
         except FuturesTimeoutError as exc:
-            logger.error("Gemini request timed out after %ss", self.timeout_seconds)
-            raise RuntimeError(f"Gemini request timed out after {self.timeout_seconds}s") from exc
+            logger.error(
+                "Groq request timed out after %ss (model=%s)",
+                self.timeout_seconds,
+                self.model_name,
+            )
+            raise RuntimeError(
+                f"Groq request timed out after {self.timeout_seconds}s"
+            ) from exc
         except Exception as exc:
-            logger.exception("Gemini generate_content failed")
-            raise RuntimeError(f"Gemini API error: {exc}") from exc
+            logger.exception(
+                "Groq chat completion failed (model=%s): %s",
+                self.model_name,
+                exc,
+            )
+            raise RuntimeError(f"Groq API error: {exc}") from exc
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        """
+        Single-turn completion (explain flow and simple chat wrappers).
+
+        Args:
+            prompt: User message / full instruction prompt.
+            system: Optional system instruction.
+        """
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        return self.complete_chat(messages)
 
 
-# Module-level client (lazy)
-_client: GeminiClient | None = None
+# Module-level client (lazy singleton)
+_client: GroqClient | None = None
 
 
-def get_gemini_client() -> GeminiClient:
-    """Return a shared GeminiClient instance."""
+def get_groq_client() -> GroqClient:
+    """Return a shared GroqClient instance."""
     global _client
     if _client is None:
-        timeout = int(os.getenv("GEMINI_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)))
-        model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
-        _client = GeminiClient(
-            api_key=os.getenv("GEMINI_API_KEY"),
+        timeout = int(os.getenv("GROQ_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)))
+        model = os.getenv("GROQ_MODEL", DEFAULT_MODEL)
+        api_key = os.getenv("GROQ_API_KEY")
+        logger.debug("Groq API key configured: %s", bool(api_key))
+        _client = GroqClient(
+            api_key=api_key,
             model_name=model,
             timeout_seconds=timeout,
         )
     return _client
 
 
+def get_llm_client() -> GroqClient:
+    """Alias for provider-agnostic access (e.g. future /api/chat)."""
+    return get_groq_client()
+
+
 # ---------------------------------------------------------------------------
-# Fallback templates (no Gemini)
+# Fallback templates (no LLM)
 # ---------------------------------------------------------------------------
 
 _FALLBACK_EN: dict[str, dict[str, str]] = {
@@ -151,12 +209,6 @@ _FALLBACK_HI: dict[str, dict[str, str]] = {
 }
 
 
-def _ensure_disclaimer(text: str) -> str:
-    if MEDICAL_DISCLAIMER not in text:
-        return f"{text.rstrip()} {MEDICAL_DISCLAIMER}"
-    return text
-
-
 def _derive_urgency_level(statuses: list[str]) -> UrgencyLevel:
     if any(s == "abnormal" for s in statuses):
         return "high"
@@ -166,6 +218,7 @@ def _derive_urgency_level(statuses: list[str]) -> UrgencyLevel:
 
 
 def _fallback_urgency_summary(level: UrgencyLevel, language: str) -> str:
+    language = normalize_language(language)
     if language == "hindi":
         summaries = {
             "low": "आपके परिणाम ज्यादातर सामान्य सीमा में हैं।",
@@ -178,7 +231,7 @@ def _fallback_urgency_summary(level: UrgencyLevel, language: str) -> str:
             "medium": "Some results are near or slightly outside the usual ranges.",
             "high": "One or more results are outside the usual reference ranges.",
         }
-    return _ensure_disclaimer(summaries[level])
+    return apply_global_disclaimer(summaries[level], language=language)
 
 
 def generate_fallback_explanations(
@@ -186,9 +239,11 @@ def generate_fallback_explanations(
     language: str,
 ) -> ExplainResponse:
     """
-    Template-based explanations when Gemini is unavailable or fails.
+    Template-based explanations when the LLM is unavailable or fails.
     """
+    language = normalize_language(language)
     templates = _FALLBACK_HI if language == "hindi" else _FALLBACK_EN
+    print(f"  -> fallback template set: {'Hindi' if language == 'hindi' else 'English'}")
     explained: list[ExplainedParameter] = []
 
     for param in parameters:
@@ -201,7 +256,7 @@ def generate_fallback_explanations(
         explained.append(
             ExplainedParameter(
                 parameter=param.parameter,
-                explanation=_ensure_disclaimer(explanation),
+                explanation=explanation,
                 action=tpl["action"],
             )
         )
@@ -237,36 +292,65 @@ def _parameters_to_payload(parameters: list[ParameterExplainInput]) -> list[dict
     return rows
 
 
-def _validate_gemini_response(
+def _normalize_parameter_name(
+    raw_name: str,
+    index: int,
+    expected_parameters: list[ParameterExplainInput],
+) -> str:
+    """Map placeholder or missing names back to authoritative input names."""
+    if index < len(expected_parameters):
+        expected = expected_parameters[index].parameter
+        if is_placeholder_parameter(raw_name) or not raw_name.strip():
+            return expected
+        # Case-insensitive match to input
+        for param in expected_parameters:
+            if param.parameter.lower() == raw_name.strip().lower():
+                return param.parameter
+        return expected
+    return raw_name.strip() or "Unknown"
+
+
+def _validate_llm_response(
     data: dict[str, Any],
     expected_parameters: list[ParameterExplainInput],
     language: str = "english",
 ) -> ExplainResponse:
-    """Map parsed JSON to Pydantic models and ensure disclaimer presence."""
+    """Map parsed JSON to Pydantic models; disclaimer only on urgency_summary."""
+    language = normalize_language(language)
     urgency = data.get("urgency_level", "medium")
     if urgency not in ("low", "medium", "high"):
         urgency = _derive_urgency_level([p.status for p in expected_parameters])
 
-    summary = _ensure_disclaimer(str(data.get("urgency_summary", "")))
+    summary = apply_global_disclaimer(str(data.get("urgency_summary", "")), language=language)
 
     explained_raw = data.get("explained_parameters", [])
     explained: list[ExplainedParameter] = []
 
-    for item in explained_raw:
+    for index, item in enumerate(explained_raw):
         if not isinstance(item, dict):
             continue
+        param_name = _normalize_parameter_name(
+            str(item.get("parameter", "")),
+            index,
+            expected_parameters,
+        )
+        explanation = cleanup_explanation_text(str(item.get("explanation", "")))
+        action = cleanup_explanation_text(str(item.get("action", "Consult your doctor")))
+        if not explanation:
+            explanation = f"Your {param_name} result should be reviewed with your doctor."
+        if not action:
+            action = "Consult your doctor"
         explained.append(
             ExplainedParameter(
-                parameter=str(item.get("parameter", "")),
-                explanation=_ensure_disclaimer(str(item.get("explanation", ""))),
-                action=str(item.get("action", "Consult your doctor")),
+                parameter=param_name,
+                explanation=explanation,
+                action=action,
             )
         )
 
-    # Align count with input — pad missing entries from fallback templates if needed
     if len(explained) < len(expected_parameters):
         logger.warning(
-            "Gemini returned %d explanations for %d parameters; padding with fallback",
+            "LLM returned %d explanations for %d parameters; padding with fallback",
             len(explained),
             len(expected_parameters),
         )
@@ -285,9 +369,7 @@ def _validate_gemini_response(
                     fb
                     or ExplainedParameter(
                         parameter=param.parameter,
-                        explanation=_ensure_disclaimer(
-                            f"Your {param.parameter} result needs review."
-                        ),
+                        explanation=f"Your {param.parameter} result needs review.",
                         action="Consult a doctor",
                     )
                 )
@@ -301,38 +383,124 @@ def _validate_gemini_response(
     )
 
 
+def _log_prompt_snippet(system: str, user: str, *, stage: str, language: str) -> None:
+    """Log key language lines and a short prompt preview for debugging."""
+    for label, text in (("system", system), ("user", user)):
+        for line in text.splitlines():
+            if "REQUESTED OUTPUT LANGUAGE" in line or "MUST respond entirely" in line:
+                print(f"Explain prompt [{stage}] {label} language line:", line.strip())
+                logger.info("Explain prompt %s %s: %s", stage, label, line.strip())
+    snippet = user[:500].replace("\n", " ")
+    print(f"Explain Groq prompt snippet [{stage}] (user, first 500 chars):", snippet)
+    logger.debug(
+        "Groq prompt snippet stage=%s language=%s len_system=%d len_user=%d preview=%s",
+        stage,
+        language,
+        len(system),
+        len(user),
+        snippet,
+    )
+
+
+def _request_llm_explanation(
+    client: GroqClient,
+    parameters: list[ParameterExplainInput],
+    language: str,
+    *,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Call Groq and parse JSON (raises on invalid response)."""
+    lang = normalize_language(language)
+    stage = "strict_retry" if strict else "initial"
+
+    payload = _parameters_to_payload(parameters)
+    system = build_system_instruction(lang)
+    if strict:
+        user = build_strict_retry_user_prompt(payload, lang)
+    else:
+        user = build_user_prompt(payload, lang)
+
+    _log_prompt_snippet(system, user, stage=stage, language=lang)
+
+    raw = client.generate(user, system=system)
+    print(
+        f"Explain Groq raw response [{stage}]:"
+        f" requested_language={lang!r}"
+        f" len={len(raw)}"
+    )
+    logger.info(
+        "Groq response stage=%s requested_language=%s len=%d strict=%s",
+        stage,
+        lang,
+        len(raw),
+        strict,
+    )
+    return parse_gemini_json(raw)
+
+
 def explain_parameters(
     parameters: list[ParameterExplainInput],
     language: str = "english",
 ) -> ExplainResponse:
     """
-    Generate patient-friendly explanations via Gemini, with template fallback.
+    Generate patient-friendly explanations via Groq, with template fallback.
 
     Args:
         parameters: Backend-parsed lab values (status is authoritative).
         language: ``english`` or ``hindi``.
 
     Returns:
-        ExplainResponse always returned; ``used_fallback`` indicates Gemini was not used.
+        ExplainResponse always returned; ``used_fallback`` indicates the LLM was not used.
     """
-    if language not in ("english", "hindi"):
-        language = "english"
+    language = normalize_language(language)
+    print("Final language used:", language)
 
-    payload = _parameters_to_payload(parameters)
-    prompt = build_full_prompt(payload, language)
-
-    client = get_gemini_client()
+    client = get_groq_client()
 
     if not client.api_key:
-        logger.warning("Skipping Gemini: API key missing")
+        logger.warning("Skipping Groq: GROQ_API_KEY is missing")
         return generate_fallback_explanations(parameters, language)
 
+    # Preserve requested language for all retries
+    requested_language = language
+
     try:
-        logger.debug("Calling Gemini for %d parameter(s), language=%s", len(parameters), language)
-        raw = client.generate(prompt)
-        logger.debug("Gemini response length: %d", len(raw))
-        parsed = parse_gemini_json(raw)
-        return _validate_gemini_response(parsed, parameters, language)
-    except (RuntimeError, ValueError, json.JSONDecodeError, ValidationError) as exc:
-        logger.warning("Gemini explanation failed, using fallback: %s", exc)
-        return generate_fallback_explanations(parameters, language)
+        logger.info(
+            "Calling Groq for %d parameter(s), language=%s, model=%s",
+            len(parameters),
+            requested_language,
+            client.model_name,
+        )
+        try:
+            parsed = _request_llm_explanation(
+                client, parameters, requested_language, strict=False
+            )
+        except (json.JSONDecodeError, ValueError) as first_exc:
+            logger.warning(
+                "Groq returned invalid JSON or schema (language=%s), retrying once: %s",
+                requested_language,
+                first_exc,
+            )
+            parsed = _request_llm_explanation(
+                client,
+                parameters,
+                requested_language,
+                strict=True,
+            )
+
+        result = _validate_llm_response(parsed, parameters, requested_language)
+        return result
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "Groq returned invalid JSON after retry (language=%s), using fallback: %s",
+            requested_language,
+            exc,
+        )
+        return generate_fallback_explanations(parameters, requested_language)
+    except (RuntimeError, ValueError, ValidationError) as exc:
+        logger.warning(
+            "Groq explanation failed (language=%s), using fallback: %s",
+            requested_language,
+            exc,
+        )
+        return generate_fallback_explanations(parameters, requested_language)

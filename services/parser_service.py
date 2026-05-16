@@ -7,23 +7,70 @@ future trend tracking via stable parameter_key slugs.
 
 from __future__ import annotations
 
+import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from constants.normal_ranges import NORMAL_RANGES, NormalRange
+
+logger = logging.getLogger(__name__)
 
 Status = Literal["normal", "borderline", "abnormal"]
 
 # Default band outside normal range treated as borderline (not yet abnormal)
 _BORDERLINE_RATIO = 0.08
 
-# Numeric capture: integers, decimals, and OCR-friendly forms like "10 . 2"
-_VALUE_PATTERN = r"(\d+(?:\s*\.\s*\d+)?)"
+# Longest-match numeric token: comma-grouped thousands OR plain int/decimal
+_VALUE_PATTERN = (
+    r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?"  # 11,800 or 1,234.56
+    r"|\d+\.\d+"  # 11.8
+    r"|\d+)"  # 11800
+)
+
+# Reference interval literals: "4.5 - 11.0", "13–17", "4000 to 11000"
+_REFERENCE_RANGE_RE = re.compile(
+    r"(?P<low>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+|\d+)"
+    r"\s*(?:[-–—~]|to)\s*"
+    r"(?P<high>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+|\d+)",
+    re.IGNORECASE,
+)
+
+_REF_LINE_KEYWORDS = re.compile(
+    r"\b(?:reference|ref\.?|normal\s*range|biological\s*ref|expected\s*range|"
+    r"desirable\s*range|therapeutic\s*range)\b",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# OCR typo / alias normalization (applied before structural normalize_text)
+# ---------------------------------------------------------------------------
+
+# (regex pattern, replacement) — case-insensitive unless noted
+_OCR_TYPO_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    (r"\bhbate\b", "hba1c"),
+    (r"\bhb\s*ate\b", "hba1c"),
+    (r"\bhb\s*a\s*1\s*c\b", "hba1c"),
+    (r"\bcholesteral\b", "cholesterol"),
+    (r"\bcholestrol\b", "cholesterol"),
+    (r"\bhemoglobln\b", "hemoglobin"),
+    (r"\btriglycerrides\b", "triglycerides"),
+    (r"\btriglyceridees\b", "triglycerides"),
+    (r"\bcreatinin\b", "creatinine"),
+    (r"\bglucosse\b", "glucose"),
+    (r"\bplatelets?\s*count\b", "platelet count"),
+    (r"\bmilion/uL\b", "million/uL"),
+    (r"\bmilion/µl\b", "million/µL"),
+    (r"\bmillion/ul\b", "million/µL"),
+    (r"\b10\s*\^\s*3\s*/\s*u\s*l\b", "10^3/µL"),
+    (r"\b10\s*\^\s*6\s*/\s*u\s*l\b", "10^6/µL"),
+)
 
 # ---------------------------------------------------------------------------
 # Parameter definitions: aliases used to build tolerant regex patterns
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class ParameterPattern:
@@ -43,13 +90,22 @@ PARAMETER_PATTERNS: tuple[ParameterPattern, ...] = (
     ),
     ParameterPattern(
         "wbc",
-        ("wbc", "white blood cell", "white blood cells", "total wbc", "leucocyte count", "leukocyte count"),
-        ("10^3/ul", "10^3/µl", "/ul", "/µl", "x10^3"),
+        (
+            "wbc",
+            "white blood cell",
+            "white blood cells",
+            "total wbc",
+            "leucocyte count",
+            "leukocyte count",
+            "tlc",
+            "total leucocyte count",
+        ),
+        ("10^3/ul", "10^3/µl", "/ul", "/µl", "x10^3", "cells/ul", "cells/µl"),
     ),
     ParameterPattern(
         "rbc",
         ("rbc", "red blood cell", "red blood cells", "erythrocyte count"),
-        ("10^6/ul", "10^6/µl", "million/ul"),
+        ("10^6/ul", "10^6/µl", "million/ul", "million/µl"),
     ),
     ParameterPattern(
         "platelets",
@@ -63,7 +119,7 @@ PARAMETER_PATTERNS: tuple[ParameterPattern, ...] = (
     ),
     ParameterPattern(
         "hba1c",
-        (r"hba1c", r"hb\s*a1c", "glycated hemoglobin", "glycated haemoglobin", "a1c"),
+        (r"hba1c", r"hb\s*a1c", "glycated hemoglobin", "glycated haemoglobin", "a1c", "hbate"),
         ("%", "percent"),
     ),
     ParameterPattern(
@@ -73,7 +129,7 @@ PARAMETER_PATTERNS: tuple[ParameterPattern, ...] = (
     ),
     ParameterPattern(
         "cholesterol",
-        ("total cholesterol", "cholesterol", r"\btc\b", "serum cholesterol"),
+        ("total cholesterol", "cholesterol", "cholesteral", r"\btc\b", "serum cholesterol"),
         ("mg/dl",),
     ),
     ParameterPattern(
@@ -95,6 +151,16 @@ PARAMETER_PATTERNS: tuple[ParameterPattern, ...] = (
 
 
 @dataclass
+class ValueCandidate:
+    """A numeric candidate extracted near a parameter mention."""
+
+    value: float
+    source_line: str
+    source_snippet: str
+    score: float
+
+
+@dataclass
 class ParseResult:
     """Structured outcome of a parse run (safe for APIs and trend pipelines)."""
 
@@ -108,16 +174,47 @@ class ParseResult:
 
 
 # ---------------------------------------------------------------------------
-# Text normalization (OCR spacing / line-break issues)
+# Text normalization
 # ---------------------------------------------------------------------------
+
+
+def normalize_ocr_text(raw_text: str) -> str:
+    """
+    Fix common OCR misreads before regex parsing.
+
+    - Unicode normalization (NFKC) and symbol cleanup
+    - Known parameter/unit spelling corrections (HbAte → HbA1c, etc.)
+    - Weird punctuation → ASCII equivalents
+    - Repeated spaces collapsed
+    """
+    if not raw_text:
+        return ""
+
+    text = unicodedata.normalize("NFKC", raw_text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Common OCR punctuation / symbols
+    text = text.replace("—", "-").replace("–", "-").replace("−", "-")
+    text = text.replace(""", '"').replace(""", '"')
+    text = text.replace("'", "'").replace("'", "'")
+    text = text.replace("µ", "µ")  # keep micro sign; also map OCR 'u' via unit patterns
+    text = re.sub(r"[°º]", "", text)
+
+    for pattern, replacement in _OCR_TYPO_REPLACEMENTS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
+
 
 def normalize_text(raw_text: str) -> str:
     """
-    Clean OCR/PDF text before regex matching.
+    Clean OCR/PDF text before regex matching (after normalize_ocr_text).
 
     - Unifies whitespace and line breaks
     - Fixes split decimals (``10 . 2`` -> ``10.2``)
     - Normalizes common unit spacing (``g / dL`` -> ``g/dL``)
+    - Removes thousands separators for easier numeric parsing
     """
     if not raw_text:
         return ""
@@ -147,6 +244,11 @@ def _alias_to_regex_fragment(alias: str) -> str:
     return rf"\b{escaped}\b"
 
 
+def _compile_alias_pattern(param: ParameterPattern) -> re.Pattern[str]:
+    alias_group = "|".join(_alias_to_regex_fragment(a) for a in param.aliases)
+    return re.compile(rf"(?:{alias_group})", re.IGNORECASE)
+
+
 def _unit_alternation(unit_hints: tuple[str, ...]) -> str:
     """Build a regex alternation for optional unit fragments after a value."""
     if unit_hints:
@@ -156,71 +258,343 @@ def _unit_alternation(unit_hints: tuple[str, ...]) -> str:
 
 def _build_patterns(param: ParameterPattern) -> list[re.Pattern[str]]:
     """
-    Build regex patterns for one parameter.
+    Build regex patterns for one parameter (fallback when line-based match fails).
 
-    Tries: ``Name : value unit``, ``Name value``, and value-before-unit forms.
+    Prefers explicit separators and short windows to avoid reference-range bleed.
     """
     alias_group = "|".join(_alias_to_regex_fragment(a) for a in param.aliases)
     alias_group = f"(?:{alias_group})"
     units = _unit_alternation(param.unit_hints)
     patterns: list[str] = []
 
-    # Name ... separator ... value ... optional unit
+    # Table / label: "WBC : 11800" or "WBC  11.8"
     patterns.append(
-        rf"{alias_group}\s*[:=\-]?\s*{_VALUE_PATTERN}(?:\s*(?:{units}))?"
+        rf"{alias_group}\s*[:=\-|]\s*{_VALUE_PATTERN}(?:\s*(?:{units}))?"
     )
-    # Name on one segment, value nearby (within ~40 chars)
+    # Tight proximity after name (avoid grabbing distant Hb 13-17 on another field)
     patterns.append(
-        rf"{alias_group}.{{0,40}}?{_VALUE_PATTERN}"
+        rf"{alias_group}\s+{_VALUE_PATTERN}(?:\s*(?:{units}))?"
     )
-    # Value then unit then name (some lab layouts)
     patterns.append(
-        rf"{_VALUE_PATTERN}\s*(?:{units})?\.?\s*{alias_group}"
+        rf"{alias_group}.{{0,20}}?{_VALUE_PATTERN}(?:\s*(?:{units}))?"
     )
 
     flags = re.IGNORECASE | re.DOTALL
     return [re.compile(p, flags) for p in patterns]
 
 
-def _parse_numeric_value(match: re.Match[str]) -> float | None:
-    """Extract and normalize a float from the first capture group."""
-    raw = match.group(1)
+def _parse_numeric_token(raw: str) -> float | None:
+    """Parse a numeric token, stripping thousands separators and spaces."""
     if raw is None:
         return None
-    cleaned = re.sub(r"\s+", "", raw)
+    cleaned = re.sub(r"[\s,]", "", raw)
     try:
         return float(cleaned)
     except ValueError:
         return None
 
 
+def _parse_numeric_value(match: re.Match[str]) -> float | None:
+    """Extract and normalize a float from the first capture group."""
+    return _parse_numeric_token(match.group(1))
+
+
+def _range_bound_spans(text: str) -> list[tuple[int, int]]:
+    """Return character spans of numbers that are part of reference-range literals."""
+    spans: list[tuple[int, int]] = []
+    for match in _REFERENCE_RANGE_RE.finditer(text):
+        spans.append((match.start("low"), match.end("low")))
+        spans.append((match.start("high"), match.end("high")))
+    return spans
+
+
+def _number_in_range_literal(text: str, start: int, end: int) -> bool:
+    """True if the number at [start, end) is a bound in a range literal like 4.5-11.0."""
+    for span_start, span_end in _range_bound_spans(text):
+        if start >= span_start and end <= span_end:
+            return True
+    return False
+
+
+def _find_numbers(text: str) -> list[tuple[float, int, int]]:
+    """Return (value, start, end) for all numbers in text."""
+    found: list[tuple[float, int, int]] = []
+    for match in re.finditer(_VALUE_PATTERN, text):
+        value = _parse_numeric_token(match.group(1))
+        if value is not None:
+            found.append((value, match.start(1), match.end(1)))
+    return found
+
+
+def _scale_to_canonical_unit(param_key: str, value: float) -> float:
+    """
+    Convert absolute cell counts to canonical units used in NORMAL_RANGES.
+
+    WBC/platelets reports often use cells/µL (e.g. 11800) while ranges use 10^3/µL.
+    """
+    if param_key == "wbc" and value >= 1000:
+        return round(value / 1000.0, 2)
+    if param_key == "platelets" and value >= 10000:
+        return round(value / 1000.0, 2)
+    return value
+
+
+def _is_plausible_value(param_key: str, value: float, range_config: NormalRange) -> bool:
+    """Reject physically impossible or clearly wrong-scale values."""
+    if value < 0:
+        return False
+
+    ceilings: dict[str, float] = {
+        "hemoglobin": 25.0,
+        "wbc": 100.0,
+        "rbc": 10.0,
+        "platelets": 2000.0,
+        "glucose": 600.0,
+        "hba1c": 20.0,
+        "creatinine": 20.0,
+        "cholesterol": 500.0,
+        "hdl": 150.0,
+        "ldl": 400.0,
+        "triglycerides": 2000.0,
+    }
+    floor = 0.0
+    if param_key == "hba1c":
+        floor = 3.0
+
+    cap = ceilings.get(param_key, 1e9)
+    if value < floor or value > cap:
+        return False
+
+    # After scaling, WBC should sit in a sensible clinical band
+    if param_key == "wbc" and not (0.1 <= value <= 50):
+        return False
+
+    return True
+
+
+def _looks_like_ref_only_line(line: str) -> bool:
+    """Lines that only describe reference intervals, not patient results."""
+    if _REF_LINE_KEYWORDS.search(line):
+        return True
+    lowered = line.lower()
+    if "reference" in lowered and _REFERENCE_RANGE_RE.search(line):
+        return True
+    return False
+
+
+def _line_mentions_parameter(line: str, alias_pattern: re.Pattern[str]) -> bool:
+    return alias_pattern.search(line) is not None
+
+
+def _score_candidate(
+    *,
+    value: float,
+    param_key: str,
+    range_config: NormalRange,
+    position_after_alias: int,
+    in_ref_line: bool,
+    in_range_literal: bool,
+    all_values_on_line: list[float],
+) -> float:
+    """
+    Rank candidates: prefer first value after parameter name, penalize ref-range numbers.
+    """
+    score = 100.0 - min(position_after_alias, 80)
+
+    if in_range_literal:
+        score -= 60
+    if in_ref_line:
+        score -= 40
+
+    normal_min = range_config["normal_min"]
+    normal_max = range_config["normal_max"]
+
+    # If line has a clear patient value and a ref bound, deprioritize exact ref bounds
+    ref_bounds = {normal_min, normal_max}
+    if value in ref_bounds and len(all_values_on_line) > 1:
+        larger = [v for v in all_values_on_line if v not in ref_bounds or v > normal_max * 2]
+        if larger:
+            score -= 35
+
+    # Prefer larger WBC absolute counts over small range endpoints (4.5, 11, 17 bleed)
+    if param_key == "wbc":
+        scaled = _scale_to_canonical_unit("wbc", value)
+        if value >= 1000:
+            score += 25
+        elif 4 <= value <= 12 and any(v >= 1000 for v in all_values_on_line):
+            score -= 50
+        elif scaled >= normal_min and scaled <= normal_max * 3:
+            score += 5
+
+    if param_key == "hba1c" and value > 20:
+        score -= 100
+
+    return score
+
+
+def _extract_candidates_from_line(
+    line: str,
+    param: ParameterPattern,
+    alias_pattern: re.Pattern[str],
+    range_config: NormalRange,
+) -> list[ValueCandidate]:
+    """Extract and score numeric candidates from a single line mentioning the parameter."""
+    alias_match = alias_pattern.search(line)
+    if not alias_match:
+        return []
+
+    in_ref_line = _looks_like_ref_only_line(line)
+    alias_end = alias_match.end()
+    segment = line[alias_end:] if alias_end < len(line) else line
+
+    numbers = _find_numbers(line)
+    if not numbers:
+        return []
+
+    all_values = [v for v, _, _ in numbers]
+    candidates: list[ValueCandidate] = []
+
+    for value, start, end in numbers:
+        if _number_in_range_literal(line, start, end):
+            continue
+
+        scaled = _scale_to_canonical_unit(param.key, value)
+        if not _is_plausible_value(param.key, scaled, range_config):
+            continue
+
+        pos_after_alias = max(0, start - alias_end)
+        score = _score_candidate(
+            value=scaled,
+            param_key=param.key,
+            range_config=range_config,
+            position_after_alias=pos_after_alias,
+            in_ref_line=in_ref_line,
+            in_range_literal=False,
+            all_values_on_line=[_scale_to_canonical_unit(param.key, v) for v in all_values],
+        )
+
+        snippet_start = max(0, start - 15)
+        snippet_end = min(len(line), end + 25)
+        snippet = line[snippet_start:snippet_end].strip()
+
+        candidates.append(
+            ValueCandidate(
+                value=scaled,
+                source_line=line.strip(),
+                source_snippet=snippet,
+                score=score,
+            )
+        )
+
+    # Also scan segment right after alias (prioritize first number there)
+    seg_numbers = _find_numbers(segment)
+    if seg_numbers:
+        first_val, first_start, first_end = seg_numbers[0]
+        if not _number_in_range_literal(segment, first_start, first_end):
+            scaled_first = _scale_to_canonical_unit(param.key, first_val)
+            if _is_plausible_value(param.key, scaled_first, range_config):
+                for cand in candidates:
+                    if cand.value == scaled_first:
+                        cand.score += 15
+                        break
+
+    return candidates
+
+
+def _select_best_candidate(candidates: list[ValueCandidate]) -> ValueCandidate | None:
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: c.score)
+
+
 def extract_value_for_parameter(
     text: str,
     param: ParameterPattern,
     compiled: list[re.Pattern[str]] | None = None,
-) -> float | None:
+    range_config: NormalRange | None = None,
+) -> tuple[float | None, str | None, str | None]:
     """
-    Find the first plausible numeric value for a parameter in normalized text.
+    Find the best numeric patient value for a parameter in normalized text.
 
-    Returns None if no match or value is non-physical (negative, etc.).
+    Returns:
+        (value, matched_line, source_snippet) — line/snippet are None if not found.
+
+    Strategy:
+        1. Line-based: only numbers on lines mentioning the parameter
+        2. Skip numbers inside reference-range literals (4.5-11.0)
+        3. Scale absolute WBC/platelet counts to 10^3/µL
+        4. Regex fallback with tight windows if line-based fails
     """
     patterns = compiled if compiled is not None else _build_patterns(param)
+    alias_pattern = _compile_alias_pattern(param)
+    config = range_config or NORMAL_RANGES.get(param.key)
+    if not config:
+        return None, None, None
 
+    all_candidates: list[ValueCandidate] = []
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+    for index, line in enumerate(lines):
+        if not _line_mentions_parameter(line, alias_pattern):
+            continue
+        all_candidates.extend(
+            _extract_candidates_from_line(line, param, alias_pattern, config)
+        )
+        # Value on the next line: "WBC\n11800 cells/uL"
+        if index + 1 < len(lines) and not _find_numbers(line):
+            next_line = lines[index + 1]
+            if not _line_mentions_parameter(next_line, alias_pattern):
+                combined = f"{line} {next_line}"
+                all_candidates.extend(
+                    _extract_candidates_from_line(
+                        combined, param, alias_pattern, config
+                    )
+                )
+
+    best = _select_best_candidate(all_candidates)
+    if best is not None:
+        logger.debug(
+            "Parser [%s] line match — value=%s snippet=%r",
+            param.key,
+            best.value,
+            best.source_snippet,
+        )
+        return best.value, best.source_line, best.source_snippet
+
+    # Fallback: regex on full text, still filter range literals
     for pattern in patterns:
         match = pattern.search(text)
         if not match:
             continue
-        value = _parse_numeric_value(match)
-        if value is None or value < 0:
+        raw_value = _parse_numeric_value(match)
+        if raw_value is None:
             continue
-        # Sanity caps to reduce false positives from dates/IDs
-        if param.key == "hba1c" and value > 20:
-            continue
-        if param.key in ("wbc", "rbc") and value > 1000:
-            continue
-        return value
 
-    return None
+        start = match.start(1)
+        end = match.end(1)
+        if _number_in_range_literal(text, start, end):
+            continue
+
+        scaled = _scale_to_canonical_unit(param.key, raw_value)
+        if not _is_plausible_value(param.key, scaled, config):
+            continue
+
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.start())
+        if line_end == -1:
+            line_end = len(text)
+        matched_line = text[line_start:line_end].strip()
+        snippet = matched_line[:80]
+
+        logger.debug(
+            "Parser [%s] regex fallback — value=%s snippet=%r",
+            param.key,
+            scaled,
+            snippet,
+        )
+        return scaled, matched_line, snippet
+
+    return None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +691,8 @@ def parse_lab_report(raw_text: str) -> ParseResult:
         return result
 
     try:
-        normalized = normalize_text(raw_text)
+        ocr_normalized = normalize_ocr_text(raw_text)
+        normalized = normalize_text(ocr_normalized)
     except Exception as exc:
         result.errors.append(f"Text normalization failed: {exc}")
         return result
@@ -332,7 +707,12 @@ def parse_lab_report(raw_text: str) -> ParseResult:
 
         try:
             compiled = _build_patterns(param)
-            value = extract_value_for_parameter(normalized, param, compiled)
+            value, matched_line, source_snippet = extract_value_for_parameter(
+                normalized,
+                param,
+                compiled,
+                range_config,
+            )
         except re.error as exc:
             result.warnings.append(f"Regex error for '{param.key}': {exc}")
             continue
@@ -345,6 +725,14 @@ def parse_lab_report(raw_text: str) -> ParseResult:
 
         if param.key in seen_keys:
             continue
+
+        logger.debug(
+            "Parser extracted %s=%s from line=%r source=%r",
+            param.key,
+            value,
+            matched_line,
+            source_snippet,
+        )
 
         try:
             record = build_parameter_record(param.key, value, range_config)
