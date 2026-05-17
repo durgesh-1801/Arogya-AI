@@ -17,6 +17,9 @@ build/
 uploads/
 *.tmp
 
+# Local SQLite database
+arogya.db
+
 # IDE
 .idea/
 .vscode/

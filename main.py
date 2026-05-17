@@ -14,7 +14,10 @@ from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
+from database import init_db
 from routes.explain import router as explain_router
+from routes.patients import router as patients_router
+from routes.trends import router as trends_router
 from routes.upload import router as upload_router
 
 # Load environment variables from .env if present
@@ -27,6 +30,7 @@ async def lifespan(app: FastAPI):
     # Ensure upload directory exists
     upload_dir = os.getenv("UPLOAD_DIR", "uploads")
     os.makedirs(upload_dir, exist_ok=True)
+    init_db()
     yield
 
 
@@ -73,6 +77,8 @@ app.add_middleware(
 
 app.include_router(upload_router, prefix="/api", tags=["upload"])
 app.include_router(explain_router, prefix="/api", tags=["explain"])
+app.include_router(patients_router, prefix="/api", tags=["patients"])
+app.include_router(trends_router, prefix="/api", tags=["trends"])
 
 
 @app.get("/health")
