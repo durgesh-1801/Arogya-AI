@@ -9,9 +9,12 @@ import logging
 import os
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from sqlalchemy.orm import Session
 
+from database.session import get_db
 from schemas.report_schema import ExtractionResponse, FileType
+from services.report_storage_service import PatientNotFoundError, save_parsed_report
 from services.report_pipeline import (
     ExtractionError,
     ParseError,
@@ -31,7 +34,18 @@ NO_PARAMETERS_MESSAGE = "No medical parameters detected"
 
 
 @router.post("/upload", response_model=ExtractionResponse)
-async def upload_report(file: UploadFile = File(...)):
+async def upload_report(
+    file: UploadFile = File(...),
+    patient_id: int | None = Query(
+        default=None,
+        description="Existing patient id to attach this report to",
+    ),
+    patient_name: str | None = Query(
+        default=None,
+        description="Create a new patient with this name when patient_id is omitted",
+    ),
+    db: Session = Depends(get_db),
+):
     """
     Upload an OPD lab report (PDF or image).
 
@@ -87,6 +101,22 @@ async def upload_report(file: UploadFile = File(...)):
                 message=NO_PARAMETERS_MESSAGE,
             )
 
+        stored_patient_id: int | None = None
+        stored_report_id: int | None = None
+        if patient_id is not None or patient_name:
+            try:
+                patient, report = save_parsed_report(
+                    db,
+                    filename=file.filename,
+                    parameters=parameters,
+                    patient_id=patient_id,
+                    patient_name=patient_name,
+                )
+                stored_patient_id = patient.id
+                stored_report_id = report.id
+            except PatientNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+
         return ExtractionResponse(
             success=True,
             filename=file.filename,
@@ -95,6 +125,8 @@ async def upload_report(file: UploadFile = File(...)):
             page_count=page_count,
             parameters=parameters,
             message=f"Extracted {len(parameters)} medical parameter(s)",
+            patient_id=stored_patient_id,
+            report_id=stored_report_id,
         )
 
     except ExtractionError as exc:

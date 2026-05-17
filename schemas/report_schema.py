@@ -53,3 +53,11 @@ class ExtractionResponse(BaseModel):
         description="Structured lab parameters with status",
     )
     message: str = Field(default="", description="Human-readable status or error message")
+    patient_id: int | None = Field(
+        default=None,
+        description="Patient id when report was persisted (optional query param)",
+    )
+    report_id: int | None = Field(
+        default=None,
+        description="Stored report id when persistence succeeded",
+    )
